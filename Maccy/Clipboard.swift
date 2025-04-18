@@ -1,6 +1,8 @@
 import AppKit
 import Defaults
 import Sauce
+import Foundation
+import os.log
 
 class Clipboard {
   static let shared = Clipboard()
@@ -34,6 +36,8 @@ class Clipboard {
   private var disabledTypes: Set<NSPasteboard.PasteboardType> { supportedTypes.subtracting(enabledTypes) }
 
   private var sourceApp: NSRunningApplication? { NSWorkspace.shared.frontmostApplication }
+
+  private static let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "Clipboard")
 
   init() {
     changeCount = pasteboard.changeCount
@@ -153,39 +157,62 @@ class Clipboard {
     }
 
     changeCount = pasteboard.changeCount
+    Self.logger.debug("Pasteboard change detected. New count: \(self.changeCount)")
 
     if Defaults[.ignoreEvents] {
+      Self.logger.debug("Ignoring event based on Defaults[.ignoreEvents]")
       if Defaults[.ignoreOnlyNextEvent] {
         Defaults[.ignoreEvents] = false
         Defaults[.ignoreOnlyNextEvent] = false
       }
-
       return
     }
 
-    // Reading types on NSPasteboard gives all the available
-    // types - even the ones that are not present on the NSPasteboardItem.
-    // See https://github.com/p0deje/Maccy/issues/241.
-    if shouldIgnore(Set(pasteboard.types ?? [])) {
+    let currentSourceApp = sourceApp
+    let bundleId = currentSourceApp?.bundleIdentifier ?? "Unknown"
+    Self.logger.debug("Processing copy from app: \(bundleId, privacy: .public)")
+
+    let currentTypes = Set(pasteboard.types ?? [])
+    if shouldIgnore(currentTypes) {
+      Self.logger.debug("Ignoring copy based on types: \(currentTypes.map { $0.rawValue })")
       return
     }
 
-    if let sourceAppBundle = sourceApp?.bundleIdentifier, shouldIgnore(sourceAppBundle) {
+    if shouldIgnore(bundleId) {
+      Self.logger.debug("Ignoring copy based on bundle identifier: \(bundleId, privacy: .public)")
       return
     }
 
-    // Some applications (BBEdit, Edge) add 2 items to pasteboard when copying
-    // so it's better to merge all data into a single record.
-    // - https://github.com/p0deje/Maccy/issues/78
-    // - https://github.com/p0deje/Maccy/issues/472
     var contents = [HistoryItemContent]()
+    var potentialSourceURL: String? = nil
+
     pasteboard.pasteboardItems?.forEach({ item in
       var types = Set(item.types)
+      Self.logger.debug("Processing pasteboard item with types: \(types.map { $0.rawValue })")
+
+      let chromeURLType = NSPasteboard.PasteboardType("org.chromium.source-url")
+      if types.contains(chromeURLType) {
+        if let urlData = item.data(forType: chromeURLType),
+           let urlString = String(data: urlData, encoding: .utf8) {
+          potentialSourceURL = urlString
+          Self.logger.debug("Found Chrome source URL in pasteboard item: \(urlString, privacy: .public)")
+        } else {
+          Self.logger.warning("Found Chrome source URL type but failed to decode data.")
+        }
+      }
+
       if types.contains(.string) && isEmptyString(item) && !richText(item) {
+        Self.logger.debug("Ignoring item because it's effectively empty string.")
         return
       }
 
       if shouldIgnore(item) {
+        Self.logger.debug("Ignoring item based on content regex.")
+        return
+      }
+      
+      if bundleId == "com.apple.Preview" && types == [.tiff] {
+        Self.logger.debug("Ignoring item from Preview (likely screenshot).")
         return
       }
 
@@ -194,12 +221,10 @@ class Clipboard {
         .filter { !$0.rawValue.starts(with: dynamicTypePrefix) }
         .filter { !$0.rawValue.starts(with: microsoftSourcePrefix) }
 
-      // Avoid reading Microsoft Word links from bookmarks and cross-references.
-      // https://github.com/p0deje/Maccy/issues/613
-      // https://github.com/p0deje/Maccy/issues/770
       if types.isSuperset(of: [.microsoftLinkSource, .microsoftObjectLink]) {
         types = types.subtracting([.microsoftLinkSource, .microsoftObjectLink, .pdf])
       }
+       Self.logger.debug("Filtered item types: \(types.map { $0.rawValue })")
 
       types.forEach { type in
         contents.append(HistoryItemContent(type: type.rawValue, value: item.data(forType: type)))
@@ -207,22 +232,31 @@ class Clipboard {
     })
 
     guard !contents.isEmpty else {
+      Self.logger.debug("Ignoring copy because final contents are empty after processing items.")
       return
     }
+     Self.logger.debug("Final processed contents count: \(contents.count)")
 
     let historyItem = HistoryItem()
     Storage.shared.context.insert(historyItem)
 
     historyItem.contents = contents
-    historyItem.application = sourceApp?.bundleIdentifier
+    historyItem.application = bundleId
     historyItem.title = historyItem.generateTitle()
-    
-    // Capture URL from Chrome if applicable
-    if Defaults[.trackChromeURLs] && sourceApp?.bundleIdentifier?.contains("com.google.Chrome") == true {
-      historyItem.sourceURL = getCurrentChromeURL()
+
+    let trackChrome = Defaults[.trackChromeURLs]
+    let isChrome = bundleId.contains("com.google.Chrome")
+    Self.logger.debug("Checking Chrome URL: trackChromeURLs=\(trackChrome), isChrome=\(isChrome)")
+
+    if trackChrome && isChrome && potentialSourceURL != nil {
+      historyItem.sourceURL = potentialSourceURL
+      Self.logger.debug("Assigned sourceURL from pasteboard: \(potentialSourceURL!, privacy: .public)")
+    } else {
+      Self.logger.debug("Source URL not assigned (trackChrome=\(trackChrome), isChrome=\(isChrome), urlFound=\(potentialSourceURL != nil))")
     }
 
     onNewCopyHooks.forEach({ $0(historyItem) })
+     Self.logger.debug("Finished processing pasteboard change.")
   }
 
   private func shouldIgnore(_ types: Set<NSPasteboard.PasteboardType>) -> Bool {
@@ -313,24 +347,5 @@ class Clipboard {
     }
 
     return newContents
-  }
-
-  private func getCurrentChromeURL() -> String? {
-    guard sourceApp?.bundleIdentifier?.contains("com.google.Chrome") == true else {
-      return nil
-    }
-    
-    let script = """
-    tell application "Google Chrome"
-      get URL of active tab of first window
-    end tell
-    """
-    
-    var error: NSDictionary?
-    if let scriptObject = NSAppleScript(source: script) {
-      let output = scriptObject.executeAndReturnError(&error)
-      return error == nil ? output.stringValue : nil
-    }
-    return nil
   }
 }

@@ -23,6 +23,32 @@ struct PreviewItemView: View {
       Divider()
         .padding(.vertical)
 
+      // --- Source URL Display ---
+      if let url = item.sourceURL, !url.isEmpty {
+          HStack {
+              Text("SourceURL:", tableName: "PreviewItemView") // Added label
+              Spacer()
+          }
+          // Inlined SourceURLView logic:
+          HStack {
+              Image(systemName: "link")
+                  .font(.caption)
+              
+              Text(url)
+                  .font(.caption)
+                  .lineLimit(1)
+                  .truncationMode(.middle)
+          }
+          .foregroundColor(.secondary)
+          .padding(.horizontal, 4) // Padding from original SourceURLView
+          .onTapGesture {
+              guard let nsUrl = URL(string: url) else { return }
+              NSWorkspace.shared.open(nsUrl)
+          }
+          .padding(EdgeInsets(top: 0, leading: 0, bottom: 3, trailing: 0)) // Corrected padding syntax using EdgeInsets
+      }
+      // --- End Source URL Display ---
+
       if let application = item.application {
         HStack(spacing: 3) {
           Text("Application", tableName: "PreviewItemView")
